@@ -8,6 +8,7 @@ Set-Location -LiteralPath $script:ProjectRoot
 
 $script:SourcePath = Join-Path $script:ProjectRoot 'get_wallpapers.py'
 $script:SpecPath = Join-Path $script:ProjectRoot 'get_wallpapers.spec'
+$script:VenvRoot = Join-Path $script:ProjectRoot '.venv'
 $script:VenvPython = Join-Path $script:ProjectRoot '.venv\Scripts\python.exe'
 $script:BrowserExe = Join-Path $script:ProjectRoot 'browser\chrome-win64\chrome.exe'
 $script:BrowserDll = Join-Path $script:ProjectRoot 'browser\chrome-win64\chrome.dll'
@@ -69,6 +70,19 @@ function Find-HostPython {
                 $major = [int]$Matches[1]
                 $minor = [int]$Matches[2]
                 if (($major -gt 3) -or (($major -eq 3) -and ($minor -ge 10))) {
+                    $pythonArguments = @()
+                    if ($candidate.Prefix.Count -gt 0) {
+                        $pythonArguments += $candidate.Prefix
+                    }
+                    $pythonArguments += @('-c', 'import sys; print(sys.executable)')
+                    $resolvedPath = (& $candidate.Path @pythonArguments 2>$null | Out-String).Trim()
+                    if (Test-Path -LiteralPath $resolvedPath -PathType Leaf) {
+                        return [pscustomobject]@{
+                            Path = $resolvedPath
+                            Prefix = @()
+                            Version = $versionText
+                        }
+                    }
                     return [pscustomobject]@{
                         Path = $candidate.Path
                         Prefix = $candidate.Prefix
@@ -106,20 +120,40 @@ function Invoke-VenvPython {
     }
 }
 
+function Test-VenvPython {
+    if (-not (Test-Path -LiteralPath $script:VenvPython -PathType Leaf)) {
+        return $false
+    }
+    $oldErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $null = & $script:VenvPython --version 2>&1
+        return $LASTEXITCODE -eq 0
+    } finally {
+        $ErrorActionPreference = $oldErrorAction
+    }
+}
+
 # 检查虚拟环境中的 Python 包和 PyInstaller。
 function Get-EnvironmentStatus {
     $sourceOk = Test-Path -LiteralPath $script:SourcePath -PathType Leaf
     $specOk = Test-Path -LiteralPath $script:SpecPath -PathType Leaf
     $hostPythonOk = $null -ne $script:HostPythonPath
-    $venvOk = Test-Path -LiteralPath $script:VenvPython -PathType Leaf
+    $venvOk = Test-VenvPython
     $dependenciesOk = $false
     $pyinstallerOk = $false
 
     if ($venvOk) {
-        $null = & $script:VenvPython -c 'import Crypto, websocket' 2>$null
-        $dependenciesOk = $LASTEXITCODE -eq 0
-        $null = & $script:VenvPython -m PyInstaller --version 2>$null
-        $pyinstallerOk = $LASTEXITCODE -eq 0
+        $oldErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            $null = & $script:VenvPython -c 'import Crypto, websocket' 2>&1
+            $dependenciesOk = $LASTEXITCODE -eq 0
+            $null = & $script:VenvPython -m PyInstaller --version 2>&1
+            $pyinstallerOk = $LASTEXITCODE -eq 0
+        } finally {
+            $ErrorActionPreference = $oldErrorAction
+        }
     }
 
     $browserOk = (Test-Path -LiteralPath $script:BrowserExe -PathType Leaf) -and
@@ -212,9 +246,16 @@ function Install-BundledBrowser {
 
 # 补齐虚拟环境、Python 依赖和打包工具。
 function Install-MissingEnvironment {
-    if (-not (Test-Path -LiteralPath $script:VenvPython -PathType Leaf)) {
+    if (-not (Test-VenvPython)) {
+        if (Test-Path -LiteralPath $script:VenvRoot -PathType Container) {
+            Write-Host '检测到残缺虚拟环境，正在重新创建 ...' -ForegroundColor Yellow
+            [System.IO.Directory]::Delete($script:VenvRoot, $true)
+        }
         Write-Host '正在创建 .venv ...' -ForegroundColor Cyan
         Invoke-HostPython @('-m', 'venv', '.venv')
+        if (-not (Test-VenvPython)) {
+            throw '虚拟环境创建后无法启动 .venv\Scripts\python.exe。'
+        }
     }
 
     $status = Get-EnvironmentStatus
