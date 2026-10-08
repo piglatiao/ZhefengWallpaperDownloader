@@ -1,1 +1,4 @@
 _chrome_crawl/
+browser
+dist*
+build_single
