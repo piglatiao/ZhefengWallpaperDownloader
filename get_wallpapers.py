@@ -27,6 +27,8 @@
     需登录（10次/日）或等次日重置后再跑本脚本。
 """
 import base64
+import atexit
+from collections import OrderedDict
 import gzip
 import json
 import os
@@ -38,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -105,6 +108,12 @@ UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
 
 DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 REMOTE_OPENER = None
+REMOTE_RETRIES = 2
+REMOTE_RETRY_DELAY = 0.8
+REMOTE_MIN_INTERVAL = 0.15
+_REMOTE_RATE_LOCK = threading.Lock()
+_NEXT_REMOTE_REQUEST = 0.0
+_REMOTE_RETRYABLE = (TimeoutError, ConnectionError, socket.timeout)
 
 # ---- AES 解密（列表 / 分类 SSR 数据）----
 from Crypto.Cipher import AES
@@ -120,9 +129,76 @@ def decrypt(c):
 
 def open_remote(req, timeout):
     """按启动时选择的网络模式打开远程请求。"""
+    _wait_remote_slot()
     if REMOTE_OPENER is None:
         return urllib.request.urlopen(req, timeout=timeout)
     return REMOTE_OPENER.open(req, timeout=timeout)
+
+
+def _wait_remote_slot():
+    """控制远端请求启动间隔，避免短时间内形成突发请求。"""
+    global _NEXT_REMOTE_REQUEST
+    with _REMOTE_RATE_LOCK:
+        now = time.monotonic()
+        wait = max(0.0, _NEXT_REMOTE_REQUEST - now)
+        _NEXT_REMOTE_REQUEST = max(now, _NEXT_REMOTE_REQUEST) + REMOTE_MIN_INTERVAL
+    if wait:
+        time.sleep(wait)
+
+
+def _is_retryable_remote_error(exc):
+    """判断远端错误是否适合重试，不重试业务状态码。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (408, 500, 502, 503, 504)
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        return reason is not exc and _is_retryable_remote_error(reason)
+    return isinstance(exc, _REMOTE_RETRYABLE)
+
+
+def _remote_error_status(exc):
+    """将远端异常转换为本地 API 应返回的状态码。"""
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 404:
+            return 404
+        if exc.code == 429:
+            return 429
+        if exc.code in (408, 504):
+            return 504
+        if exc.code == 503:
+            return 503
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if reason is not exc:
+            return _remote_error_status(reason)
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return 504
+    return 502
+
+
+def _remote_retry_delay(exc, attempt):
+    """计算退避时间；远端明确给出 Retry-After 时优先遵守。"""
+    delay = REMOTE_RETRY_DELAY * (2 ** attempt)
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            retry_after = float(exc.headers.get('Retry-After', ''))
+            delay = max(delay, min(retry_after, 30.0))
+        except (TypeError, ValueError):
+            pass
+    return delay
+
+
+def read_remote(req, timeout, retries=REMOTE_RETRIES):
+    """读取远端响应并确保关闭连接；只对临时网络错误退避重试。"""
+    for attempt in range(retries + 1):
+        try:
+            with open_remote(req, timeout=timeout) as response:
+                return response.read()
+        except Exception as exc:
+            if attempt >= retries or not _is_retryable_remote_error(exc):
+                raise
+            time.sleep(_remote_retry_delay(exc, attempt))
+    raise RuntimeError('远程请求失败')
 
 
 def configure_network(proxy):
@@ -149,9 +225,12 @@ def proxy_available(proxy):
 # 不再启动时交互式询问。代理仅通过环境变量 HAO_PROXY 设置（不设则直连）。
 
 
-def get_html(path):
-    req = urllib.request.Request(BASE + path, headers={'User-Agent': UA, 'Accept': 'text/html,*/*'})
-    d = open_remote(req, timeout=30).read()
+def get_html(path, timeout=30, retries=REMOTE_RETRIES):
+    """读取远端 HTML；timeout 为单次读取超时，retries 为失败重试次数。"""
+    req = urllib.request.Request(
+        BASE + path,
+        headers={'User-Agent': UA, 'Accept': 'text/html,*/*', 'Accept-Encoding': 'gzip'})
+    d = read_remote(req, timeout=timeout, retries=retries)
     try:
         d = gzip.decompress(d)
     except Exception:
@@ -161,13 +240,28 @@ def get_html(path):
 
 def get_list(kind, page=1, type_id=None):
     """解密某一分类某页的壁纸列表；返回 dict(list/pages/total) 或 None。"""
+    cache_key = (kind, page, type_id or TYPE_ID)
+    now = time.monotonic()
+    with _LIST_CACHE_LOCK:
+        cached = _LIST_CACHE.get(cache_key)
+        if cached:
+            expires, data = cached
+            if expires > now:
+                _LIST_CACHE.move_to_end(cache_key)
+                return data
+            _LIST_CACHE.pop(cache_key, None)
     view = 'mobileView' if kind == 'mobile' else 'homeView'
     url = f'/{view}?page={page}&typeId={type_id or TYPE_ID}&sortType=3'
-    h = get_html(url).replace('\\u002F', '/').replace('\\u002B', '+').replace('\\/', '/')
+    h = get_html(url, timeout=20, retries=1).replace('\\u002F', '/').replace('\\u002B', '+').replace('\\/', '/')
     for c in re.findall(r'"([A-Za-z0-9+/]{200,}={0,2})"', h):
         try:
             o = json.loads(decrypt(c))
             if isinstance(o, dict) and 'list' in o and 'pages' in o:
+                with _LIST_CACHE_LOCK:
+                    _LIST_CACHE[cache_key] = (time.monotonic() + _LIST_CACHE_TTL, o)
+                    _LIST_CACHE.move_to_end(cache_key)
+                    while len(_LIST_CACHE) > _LIST_CACHE_MAX_ITEMS:
+                        _LIST_CACHE.popitem(last=False)
                 return o
         except Exception:
             continue
@@ -177,8 +271,9 @@ def get_list(kind, page=1, type_id=None):
 def get_json(path):
     """请求 JSON 接口（带可选代理），返回解析后的 dict。"""
     req = urllib.request.Request(BASE + path,
-                                 headers={'User-Agent': UA, 'Accept': 'application/json,*/*'})
-    d = open_remote(req, timeout=30).read()
+                                 headers={'User-Agent': UA, 'Accept': 'application/json,*/*',
+                                          'Accept-Encoding': 'gzip'})
+    d = read_remote(req, timeout=30)
     try:
         d = gzip.decompress(d)
     except Exception:
@@ -213,8 +308,8 @@ def fetch_thumb(file_id):
     """抓取缩略图（服务端代理，规避防盗链），返回 jpeg 字节。"""
     req = urllib.request.Request(
         f'{BASE}/link/common/file/getCroppingImg/{file_id}',
-        headers={'User-Agent': UA, 'Referer': BASE + '/'})
-    d = open_remote(req, timeout=30).read()
+        headers={'User-Agent': UA, 'Referer': BASE + '/', 'Accept-Encoding': 'gzip'})
+    d = read_remote(req, timeout=30)
     if d[:2] == b'\x1f\x8b':
         try:
             d = gzip.decompress(d)
@@ -282,7 +377,7 @@ def free_port():
 
 def download(url, path):
     req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': BASE + '/'})
-    d = open_remote(req, timeout=180).read()
+    d = read_remote(req, timeout=180, retries=1)
     with open(path, 'wb') as f:
         f.write(d)
     return len(d)
@@ -382,7 +477,15 @@ class BrowserSession:
 
     def quit(self):
         try:
-            self.proc.terminate(); self.proc.wait(timeout=5)
+            if self.proc.poll() is None:
+                if os.name == 'nt':
+                    subprocess.run(
+                        ['taskkill', '/PID', str(self.proc.pid), '/T', '/F'],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False)
+                else:
+                    self.proc.terminate()
+                self.proc.wait(timeout=5)
         except Exception:
             try:
                 self.proc.kill(); self.proc.wait(timeout=5)
@@ -402,7 +505,8 @@ def get_one(sess, kind, wid):
     c = None
     target_id = None
     try:
-        c, target_id = sess.new_tab(f'{BASE}/mobileViewLook/{wid}')
+        view = 'mobileViewLook' if kind == 'mobile' else 'homeViewLook'
+        c, target_id = sess.new_tab(f'{BASE}/{view}/{wid}')
         c.send('Network.enable')
         c.send('Runtime.enable')
         _wait_page_ready(c, timeout=15)
@@ -481,7 +585,38 @@ def get_one(sess, kind, wid):
 
 PROXY = os.environ.get('HAO_PROXY')  # 设为 http(s)://host:port 走代理；留空直连
 JOBS = {}                 # jid -> 进度对象
-_THUMB_CACHE = {}         # fileId -> jpeg 字节
+_LIST_CACHE = OrderedDict()  # (kind, page, type_id) -> (过期时间, 列表数据)
+_LIST_CACHE_LOCK = threading.Lock()
+_LIST_CACHE_TTL = 60
+_LIST_CACHE_MAX_ITEMS = 32
+_THUMB_CACHE = OrderedDict()  # fileId -> jpeg 字节
+_THUMB_CACHE_LOCK = threading.Lock()
+_THUMB_FETCH_LIMIT = threading.BoundedSemaphore(6)
+_THUMB_CACHE_MAX_ITEMS = 128
+_CLIENT_DISCONNECTED = (BrokenPipeError, ConnectionResetError,
+                        ConnectionAbortedError, TimeoutError)
+
+
+def cleanup_runtime_cache():
+    """清空运行时缓存并删除临时 Chromium 用户目录。"""
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE.clear()
+    with _THUMB_CACHE_LOCK:
+        _THUMB_CACHE.clear()
+    if not os.path.isdir(TMP):
+        return True
+    for _ in range(10):
+        try:
+            shutil.rmtree(TMP)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+atexit.register(cleanup_runtime_cache)
 
 
 def run_download_job(jid, kind, items, headless=True):
@@ -537,25 +672,32 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass  # 静默访问日志
 
-    def _send(self, body, ctype):
+    def _write_body(self, body, ctype, code=200, headers=None):
+        """向本地浏览器发送响应；客户端提前断开时安静结束。"""
         try:
-            self.send_response(200)
+            self.send_response(code)
             self.send_header('Content-Type', ctype)
             self.send_header('Content-Length', str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except _CLIENT_DISCONNECTED:
+            return False
+        return True
+
+    def _send(self, body, ctype):
+        return self._write_body(body, ctype)
 
     def _json(self, obj, code=200):
         body = json.dumps(obj, ensure_ascii=False).encode('utf-8')
-        self.send_response(code)
-        self.send_header('Content-Type', 'application/json; charset=utf-8')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
+        return self._write_body(body, 'application/json; charset=utf-8', code)
+
+    def _send_error(self, code, message=None):
+        """发送错误响应；浏览器已断开时不再制造二次异常。"""
         try:
-            self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+            self.send_error(code, message)
+        except _CLIENT_DISCONNECTED:
             pass
 
     def do_GET(self):
@@ -571,14 +713,16 @@ class Handler(BaseHTTPRequestHandler):
                 cats = [{'id': c.get('id'), 'name': c.get('typeName', '')} for c in get_categories()]
                 self._json({'ok': True, 'categories': cats})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+                self._json({'ok': False, 'error': str(e)}, _remote_error_status(e))
 
         elif path == '/api/list':
             try:
                 kind = qs.get('kind', ['home'])[0]
                 type_id = qs.get('type_id', [None])[0]
                 page = int(qs.get('page', ['1'])[0])
-                data = get_list(kind, page, type_id) or {}
+                data = get_list(kind, page, type_id)
+                if data is None:
+                    raise RuntimeError('远端列表响应解析失败')
                 items = [{
                     'wtId': it.get('wtId'),
                     'fileId': it.get('fileId'),
@@ -590,35 +734,42 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({'ok': True, 'page': page, 'pages': data.get('pages', 0),
                             'total': data.get('total', 0), 'items': items})
             except Exception as e:
-                self._json({'ok': False, 'error': str(e)}, 500)
+                self._json({'ok': False, 'error': str(e)}, _remote_error_status(e))
 
         elif path == '/thumb':
             fid = qs.get('fileId', [''])[0]
             if not fid:
-                self.send_error(400)
+                self._send_error(400)
                 return
-            data = _THUMB_CACHE.get(fid)
+            with _THUMB_CACHE_LOCK:
+                data = _THUMB_CACHE.get(fid)
+                if data is not None:
+                    _THUMB_CACHE.move_to_end(fid)
             if data is None:
                 try:
-                    data = fetch_thumb(fid)
-                    _THUMB_CACHE[fid] = data
-                except Exception:
-                    data = b''
+                    with _THUMB_FETCH_LIMIT:
+                        with _THUMB_CACHE_LOCK:
+                            data = _THUMB_CACHE.get(fid)
+                            if data is not None:
+                                _THUMB_CACHE.move_to_end(fid)
+                        if data is None:
+                            data = fetch_thumb(fid)
+                            if data:
+                                with _THUMB_CACHE_LOCK:
+                                    _THUMB_CACHE[fid] = data
+                                    _THUMB_CACHE.move_to_end(fid)
+                                    while len(_THUMB_CACHE) > _THUMB_CACHE_MAX_ITEMS:
+                                        _THUMB_CACHE.popitem(last=False)
+                except Exception as e:
+                    self._send_error(_remote_error_status(e), '缩略图获取失败')
+                    return
             if not data:
-                self.send_error(404)
+                self._send_error(404)
                 return
             ctype = ('image/webp' if data[:4] == b'RIFF' else
                      'image/png' if data[:4] == b'\x89PNG' else
                      'image/gif' if data[:4] == b'GIF8' else 'image/jpeg')
-            self.send_response(200)
-            self.send_header('Content-Type', ctype)
-            self.send_header('Cache-Control', 'max-age=86400')
-            self.send_header('Content-Length', str(len(data)))
-            self.end_headers()
-            try:
-                self.wfile.write(data)
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+            self._write_body(data, ctype, headers={'Cache-Control': 'max-age=86400'})
 
         elif path == '/api/progress':
             jid = qs.get('id', [''])[0]
@@ -626,11 +777,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(job if job else {'ok': False, 'error': 'no such job'})
 
         else:
-            self.send_error(404)
+            self._send_error(404)
 
     def do_POST(self):
         if urllib.parse.urlparse(self.path).path != '/api/download':
-            self.send_error(404)
+            self._send_error(404)
             return
         try:
             n = int(self.headers.get('Content-Length', 0))
@@ -744,51 +895,100 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="btn primary" id="dl" disabled>下载所选</button>
 </div>
 <script>
-const state={kind:'home',typeId:'',catName:'',page:1,pages:1,items:[],sel:new Map(),jobId:null,timer:null};
+const state={kind:'home',typeId:'',catName:'',page:1,pages:1,items:[],sel:new Map(),jobId:null,timer:null,loadController:null,loadRequest:0,pageCache:new Map(),pagePending:new Map(),loading:false};
 const $=s=>document.querySelector(s);
 const esc=s=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
-async function api(u,opt){const r=await fetch(u,opt);return r.json();}
+async function api(u,opt){
+  const r=await fetch(u,opt);
+  const text=await r.text();
+  let d;
+  try{d=JSON.parse(text);}catch(_){throw new Error('服务器响应无效（HTTP '+r.status+'）');}
+  if(!r.ok&&(!d||typeof d!=='object'||d.ok===undefined))return {ok:false,error:'请求失败（HTTP '+r.status+'）'};
+  return d;
+}
 function setHint(t){const h=$('#hint');h.textContent=t;h.style.display=t?'block':'none';}
+function listKey(kind,typeId,page){return kind+'|'+typeId+'|'+page;}
+function listUrl(kind,typeId,page){return '/api/list?kind='+encodeURIComponent(kind)+'&type_id='+encodeURIComponent(typeId)+'&page='+page;}
+function prefetchPage(page,kind,typeId){
+  const key=listKey(kind,typeId,page);
+  if(state.pageCache.has(key)||state.pagePending.has(key))return;
+  const pending=api(listUrl(kind,typeId,page)).then(d=>{
+    if(d&&d.ok)state.pageCache.set(key,d);
+    return d;
+  }).catch(()=>null);
+  state.pagePending.set(key,pending);
+  pending.finally(()=>{if(state.pagePending.get(key)===pending)state.pagePending.delete(key);});
+}
 function updateBar(){$('#count').textContent=`已选 ${state.sel.size} 张`;$('#dl').disabled=state.sel.size===0;}
 
 async function loadCats(){
-  const d=await api('/api/categories');
-  if(!d.ok){setHint('分类加载失败：'+(d.error||''));return;}
-  const sel=$('#cat');sel.innerHTML='';
-  d.categories.forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name;o.dataset.name=c.name;sel.appendChild(o);});
-  state.typeId=sel.value;state.catName=sel.options[sel.selectedIndex].dataset.name;
-  loadPage(1);
+  try{
+    const d=await api('/api/categories');
+    if(!d.ok){setHint('分类加载失败：'+(d.error||''));return;}
+    const sel=$('#cat');sel.innerHTML='';
+    d.categories.forEach(c=>{const o=document.createElement('option');o.value=c.id;o.textContent=c.name;o.dataset.name=c.name;sel.appendChild(o);});
+    state.typeId=sel.value;state.catName=sel.options[sel.selectedIndex].dataset.name;
+    await loadPage(1);
+  }catch(e){setHint('分类加载失败：'+(e.message||'网络错误'));}
 }
 async function loadPage(p){
+  if(state.loadController)state.loadController.abort();
+  const requestNo=++state.loadRequest;
+  const controller=new AbortController();
+  const viewKind=state.kind;
+  const viewTypeId=state.typeId;
+  const pageKey=listKey(viewKind,viewTypeId,p);
   state.page=p;setHint('加载中…');$('#grid').innerHTML='';$('#pager').style.display='none';
-  const d=await api(`/api/list?kind=${state.kind}&type_id=${encodeURIComponent(state.typeId)}&page=${p}`);
-  if(!d.ok){setHint('加载失败：'+(d.error||''));return;}
-  state.items=d.items||[];state.pages=d.pages||1;
-  setHint(state.items.length?'':'该页没有内容');
-  const g=$('#grid');
-  state.items.forEach(it=>{
-    const card=document.createElement('div');
-    card.className='card'+(state.sel.has(it.wtId)?' sel':'');
-    card.innerHTML=`<img class="thumb" loading="lazy" src="/thumb?fileId=${encodeURIComponent(it.fileId)}" alt="">
-      <div class="tick">✓</div>
-      <div class="meta"><div class="tt">${esc(it.title)}</div>
-      <div class="dim"><span>${it.rw||'?'}×${it.rh||'?'}</span><span>${esc(it.fileMb||'')}</span></div></div>`;
-    card.onclick=()=>{if(state.sel.has(it.wtId))state.sel.delete(it.wtId);else state.sel.set(it.wtId,it);card.classList.toggle('sel');updateBar();};
-    g.appendChild(card);
-  });
-  $('#pager').style.display=state.items.length?'flex':'none';
-  $('#pageinfo').textContent=`第 ${d.page} / ${d.pages} 页（本页 ${state.items.length} 张）`;
-  $('#prev').disabled=p<=1;$('#next').disabled=p>=state.pages;
-  updateBar();
+  state.loadController=controller;
+  state.loading=true;
+  $('#prev').disabled=true;$('#next').disabled=true;
+  try{
+    let d=state.pageCache.get(pageKey);
+    if(!d){
+      const pending=state.pagePending.get(pageKey);
+      d=pending ? await pending : await api(listUrl(viewKind,viewTypeId,p),{signal:controller.signal});
+      if(!d)throw new Error('页面加载失败');
+      if(d&&d.ok)state.pageCache.set(pageKey,d);
+    }
+    if(requestNo!==state.loadRequest)return;
+    if(!d.ok){setHint('加载失败：'+(d.error||''));return;}
+    state.items=d.items||[];state.pages=d.pages||1;
+    setHint(state.items.length?'':'该页没有内容');
+    const g=$('#grid');
+    state.items.forEach(it=>{
+      const card=document.createElement('div');
+      card.className='card'+(state.sel.has(it.wtId)?' sel':'');
+      card.innerHTML='<img class="thumb" loading="lazy" src="/thumb?fileId='+encodeURIComponent(it.fileId)+'" alt="">'+
+        '<div class="tick">✓</div>'+
+        '<div class="meta"><div class="tt">'+esc(it.title)+'</div>'+
+        '<div class="dim"><span>'+(it.rw||'?')+'×'+(it.rh||'?')+'</span><span>'+esc(it.fileMb||'')+'</span></div></div>';
+      card.onclick=()=>{if(state.sel.has(it.wtId))state.sel.delete(it.wtId);else state.sel.set(it.wtId,it);card.classList.toggle('sel');updateBar();};
+      g.appendChild(card);
+    });
+    $('#pager').style.display=state.items.length?'flex':'none';
+    $('#pageinfo').textContent='第 '+d.page+' / '+d.pages+' 页（本页 '+state.items.length+' 张）';
+    updateBar();
+  }catch(e){
+    if(e.name!=='AbortError'&&requestNo===state.loadRequest)setHint('加载失败：'+(e.message||'网络错误'));
+  }finally{
+    if(requestNo===state.loadRequest){
+      state.loadController=null;
+      state.loading=false;
+      $('#prev').disabled=state.page<=1;
+      $('#next').disabled=state.page>=state.pages;
+    }
+  }
 }
 
 $('#tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
-  state.kind=b.dataset.kind;state.sel.clear();updateBar();loadPage(1);};
+  state.kind=b.dataset.kind;state.pageCache.clear();state.sel.clear();updateBar();loadPage(1);};
 $('#cat').onchange=e=>{state.typeId=e.target.value;state.catName=e.target.options[e.target.selectedIndex].dataset.name;
-  state.sel.clear();updateBar();loadPage(1);};
+  state.pageCache.clear();state.sel.clear();updateBar();loadPage(1);};
 $('#prev').onclick=()=>loadPage(Math.max(1,state.page-1));
 $('#next').onclick=()=>loadPage(Math.min(state.pages,state.page+1));
+$('#next').onmouseenter=()=>{if(!state.loading&&state.page<state.pages)prefetchPage(state.page+1,state.kind,state.typeId);};
+$('#next').onpointerdown=()=>{if(!state.loading&&state.page<state.pages)prefetchPage(state.page+1,state.kind,state.typeId);};
 $('#clear').onclick=()=>{state.sel.clear();document.querySelectorAll('.card.sel').forEach(c=>c.classList.remove('sel'));updateBar();};
 $('#selall').onclick=()=>{const g=$('#grid');state.items.forEach((it,i)=>{state.sel.set(it.wtId,it);if(g.children[i])g.children[i].classList.add('sel');});updateBar();};
 $('#dl').onclick=async()=>{
@@ -840,3 +1040,4 @@ if __name__ == '__main__':
         print('\n已结束。')
     finally:
         srv.server_close()
+        cleanup_runtime_cache()
