@@ -521,12 +521,29 @@ def free_port():
     s = socket.socket(); s.bind(('127.0.0.1', 0)); p = s.getsockname()[1]; s.close(); return p
 
 
-def download(url, path):
+def download(url, out_dir, suggested_filename=None):
+    """下载原图并保留远端返回的原始文件名，返回（文件名，字节数）。"""
     req = urllib.request.Request(url, headers={'User-Agent': UA, 'Referer': BASE + '/'})
-    d = read_remote(req, timeout=180, retries=1)
+    for attempt in range(2):
+        try:
+            with open_remote(req, timeout=180) as response:
+                filename = suggested_filename or response.headers.get_filename()
+                if not filename:
+                    filename = urllib.parse.unquote(
+                        urllib.parse.urlparse(url).path.rsplit('/', 1)[-1])
+                filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
+                if not filename:
+                    raise RuntimeError('下载响应未提供有效文件名')
+                data = response.read()
+            break
+        except Exception as exc:
+            if attempt >= 1 or not _is_retryable_remote_error(exc):
+                raise
+            time.sleep(_remote_retry_delay(exc, attempt))
+    path = os.path.join(out_dir, filename)
     with open(path, 'wb') as f:
-        f.write(d)
-    return len(d)
+        f.write(data)
+    return filename, len(data)
 
 
 # ---- 浏览器会话：一次下载任务复用同一个浏览器进程 ----
@@ -549,6 +566,7 @@ class BrowserSession:
 
     def __init__(self, headless=True, proxy=None, profile_dir=None):
         self.port = free_port()
+        self.browser = None
         self.persistent = profile_dir is not None
         self.prof = os.path.abspath(profile_dir or os.path.join(TMP, f'_job_{self.port}'))
         if self.persistent:
@@ -569,6 +587,38 @@ class BrowserSession:
                  '--remote-allow-origins=*']
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._wait_ready()
+        self._deny_downloads()
+
+    def _deny_downloads(self):
+        """禁止内置浏览器将站点下载结果写入系统下载目录。"""
+        ver = json.loads(DIRECT_OPENER.open(
+            f'http://127.0.0.1:{self.port}/json/version', timeout=5).read())
+        self.browser = CDP(ver['webSocketDebuggerUrl'])
+        try:
+            result = self.browser.send('Browser.setDownloadBehavior', {
+                'behavior': 'deny', 'eventsEnabled': True})
+            if 'error' in result:
+                self.browser.send('Browser.setDownloadBehavior', {'behavior': 'deny'})
+        except Exception:
+            try:
+                self.browser.ws.close()
+            except Exception:
+                pass
+            self.browser = None
+            raise
+
+    def take_download_filename(self):
+        """读取浏览器最近一次下载的站点建议文件名。"""
+        if not self.browser:
+            return None
+        self.browser.pump(timeout=0.05)
+        events, self.browser.ev = self.browser.ev, []
+        for event in events:
+            if event.get('method') == 'Browser.downloadWillBegin':
+                name = event.get('params', {}).get('suggestedFilename')
+                if name:
+                    return name
+        return None
 
     def _wait_ready(self, timeout=30):
         deadline = time.time() + timeout
@@ -644,6 +694,12 @@ class BrowserSession:
                 self.proc.wait(timeout=8)
             except Exception:
                 pass
+        if self.browser:
+            try:
+                self.browser.ws.close()
+            except Exception:
+                pass
+            self.browser = None
         try:
             if self.proc.poll() is None:
                 if os.name == 'nt':
@@ -678,14 +734,15 @@ def get_one(sess, kind, wid):
         c, target_id = sess.new_tab(f'{BASE}/{view}/{wid}')
         c.send('Network.enable')
         c.send('Runtime.enable')
+        c.send('Page.setDownloadBehavior', {'behavior': 'deny'})
         if not _wait_page_ready(c, timeout=15):
             # 详情页首屏偶发停留在 loading，刷新一次后重新等待页面渲染。
             try:
                 c.send('Page.reload', {'ignoreCache': True})
             except Exception:
-                return None, 'PAGE_RELOAD'
+                return None, 'PAGE_RELOAD', None
             if not _wait_page_ready(c, timeout=20):
-                return None, 'PAGE_TIMEOUT'
+                return None, 'PAGE_TIMEOUT', None
 
         c.ev.clear()
         # 点下载
@@ -697,11 +754,12 @@ def get_one(sess, kind, wid):
             if(el){el.click();return 'clicked';} return 'NO_BTN'; })()
         """)
         if clicked != 'clicked':
-            return None, str(clicked or 'NO_BTN')
+            return None, str(clicked or 'NO_BTN'), None
 
         verify_loaded = False
         verify_started = False
         verify_required = False
+        suggested_filename = None
         response_events = {}
         finished_requests = set()
         response_error = None
@@ -709,6 +767,7 @@ def get_one(sess, kind, wid):
         for _ in range(30):
             time.sleep(2)
             c.pump()
+            suggested_filename = sess.take_download_filename() or suggested_filename
             events, c.ev = c.ev, []
             done = None
             for e in events:
@@ -736,26 +795,26 @@ def get_one(sess, kind, wid):
                     del response_events[rid]
                     response_error = None
                     if st == 401:
-                        return None, 'AUTH_EXPIRED'
+                        return None, 'AUTH_EXPIRED', None
                     if st == 200 and isinstance(direct, str) and 'down.haowallpaper.com' in direct:
                         done = direct
                         break
                     if st == 305:
                         msg = str(payload.get('msg', ''))
                         if re.search(r'下载.*(次数|额度|限制|不足|用完|上限)|次数.*(不足|限制|上限)|额度.*(不足|限制|上限)|limit', msg, re.I):
-                            return None, 'QUOTA'
+                            return None, 'QUOTA', None
                         if '登录' in msg or '授权' in msg:
-                            return None, 'AUTH_EXPIRED'
+                            return None, 'AUTH_EXPIRED', None
                         if '3004' in msg or '错误的请求' in msg:
                             verify_required = True
                         else:
-                            return None, f'HTTP_{st}'
+                            return None, f'HTTP_{st}', None
                     elif st != 200:
-                        return None, f'HTTP_{st}'
+                        return None, f'HTTP_{st}', None
                 except Exception as exc:
                     response_error = str(exc)[:80]
             if done:
-                return done, 'ok'
+                return done, 'ok', suggested_filename
 
             if verify_required and not verify_loaded:
                 result = c.evl("""
@@ -770,13 +829,13 @@ def get_one(sess, kind, wid):
                 """)
                 verify_started = result == 'verify-clicked'
         if verify_required:
-            return None, 'VERIFY_TIMEOUT'
+            return None, 'VERIFY_TIMEOUT', None
         if response_error:
-            return None, 'URL_READ_ERROR'
-        return None, 'no-url'
+            return None, 'URL_READ_ERROR', None
+        return None, 'no-url', None
     except websocket.WebSocketConnectionClosedException:
         # 标签页/浏览器调试连接被对端关闭：单张失败，不击垮整个下载任务
-        return None, 'CONN_LOST'
+        return None, 'CONN_LOST', None
     finally:
         if c:
             try:
@@ -1066,7 +1125,6 @@ def run_download_job(jid, kind, items, headless=True, account_id=None, start_ind
     """后台线程：复用浏览器逐个下载，并在单张任务之间切换账号。"""
     job = JOBS[jid]
     out_dir = job['out_dir']
-    label = '手机' if kind == 'mobile' else '电脑'
     got = job.get('got', 0)
     sess = None
     index = start_index
@@ -1089,14 +1147,11 @@ def run_download_job(jid, kind, items, headless=True, account_id=None, start_ind
                     job['account_id'] = new_account_id
                     job['account_name'] = new_account_name
 
-            seq = index + 1
             with JOB_LOCK:
                 job['next_index'] = index
             it = items[index]
             wid = it.get('wtId')
-            title = _sanitize(it.get('title') or str(wid))
-            fname = f"{label}_{seq:02d}_{title}_{it.get('rw', '?')}x{it.get('rh', '?')}.jpg"
-            rec = {'file': fname, 'status': 'running', 'msg': ''}
+            rec = {'file': '', 'status': 'running', 'msg': ''}
             job['results'].append(rec)
 
             if account_id is None and guest_usage()[1] <= 0:
@@ -1108,9 +1163,9 @@ def run_download_job(jid, kind, items, headless=True, account_id=None, start_ind
                     job['next_index'] = index
                 break
 
-            direct, status = None, None
+            direct, status, suggested_filename = None, None, None
             for _ in range(2):  # 偶发 CDP 断线最多重试 1 次（浏览器会话仍存活）
-                direct, status = get_one(sess, kind, wid)
+                direct, status, suggested_filename = get_one(sess, kind, wid)
                 if status != 'CONN_LOST':
                     break
             if status == 'QUOTA':
@@ -1140,7 +1195,8 @@ def run_download_job(jid, kind, items, headless=True, account_id=None, start_ind
             try:
                 if account_id is None:
                     record_guest_download()
-                sz = download(direct, os.path.join(out_dir, fname))
+                filename, sz = download(direct, out_dir, suggested_filename)
+                rec['file'] = filename
                 rec['status'] = 'ok'
                 rec['msg'] = f'{sz / 1024:.0f} KB'
                 got += 1
@@ -1386,7 +1442,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
             label = '手机' if kind == 'mobile' else '电脑'
             cat_name = _sanitize(payload.get('cat_name') or '壁纸')
-            out_dir = os.path.join(os.getcwd(), f'哲风壁纸_{label}_{cat_name}')
+            out_dir = os.path.join(os.getcwd(), label, cat_name)
             os.makedirs(out_dir, exist_ok=True)
             headless = bool(payload.get('headless', True))  # 网页端勾选「可见窗口」时为 False
             jid = uuid.uuid4().hex[:12]
@@ -1579,11 +1635,16 @@ function prefetchPage(page,kind,typeId){
   pending.finally(()=>{if(state.pagePending.get(key)===pending)state.pagePending.delete(key);});
 }
 function updateBar(){$('#count').textContent=`已选 ${state.sel.size} 张`;$('#dl').disabled=state.sel.size===0||!state.authReady||state.jobRunning;}
+function avatarSrc(url){
+  const m=String(url||'').match(/\/getCroppingImg\/([^/?#]+)/);
+  return m?('/thumb?fileId='+encodeURIComponent(m[1])):'';
+}
 function updateAuthButton(){
   const a=state.auth.active;
   const label=a?('微信：'+a.name+' · '+state.auth.accountLimit):('游客 · '+state.auth.guest.remaining+'/'+state.auth.guest.limit);
   const b=$('#authbtn');
-  b.innerHTML=(a&&a.avatar?'<img src="'+esc(a.avatar)+'" alt="">':'')+'<span>'+esc(label)+'</span>';
+  const avatar=a?avatarSrc(a.avatar):'';
+  b.innerHTML=(avatar?'<img src="'+avatar+'" alt="">':'')+'<span>'+esc(label)+'</span>';
   b.title=a?('当前账号：'+a.name):'当前为游客模式';
 }
 function setAuthState(d){
@@ -1595,7 +1656,8 @@ function renderAuthModal(){
   const list=$('#auth-list');
   if(!state.auth.accounts.length){list.innerHTML='<div class="auth-foot">暂无已记忆账号</div>';}
   else list.innerHTML=state.auth.accounts.map(a=>{
-    const icon=a.avatar?'<img src="'+esc(a.avatar)+'" alt="">':'<span class="auth-initial">'+esc((a.name||'账').slice(0,1))+'</span>';
+    const avatar=avatarSrc(a.avatar);
+    const icon=avatar?'<img src="'+avatar+'" alt="">':'<span class="auth-initial">'+esc((a.name||'账').slice(0,1))+'</span>';
     return '<button class="auth-account" data-account-id="'+esc(a.id)+'">'+icon+'<span><strong>'+esc(a.name)+'</strong><small>每日最多 '+state.auth.accountLimit+' 张 · 使用此账号</small></span></button>';
   }).join('');
   $('#guest-mode').textContent='游客模式 · '+state.auth.guest.remaining+'/'+state.auth.guest.limit;
