@@ -32,6 +32,7 @@ from collections import OrderedDict
 import gzip
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -263,7 +264,7 @@ _REMOTE_RETRYABLE = (TimeoutError, ConnectionError, socket.timeout)
 
 # ---- AES 解密（列表 / 分类 SSR 数据）----
 from Crypto.Cipher import AES
-from Crypto.Util.Padding import unpad
+from Crypto.Util.Padding import pad, unpad
 KEY = b'68zhehao2O776519'
 IV = b'aa176b7519e84710'
 
@@ -271,6 +272,11 @@ IV = b'aa176b7519e84710'
 def decrypt(c):
     raw = bytes.fromhex(base64.b64decode(c).hex())
     return re.sub(r'\x00.*$', '', unpad(AES.new(KEY, AES.MODE_CBC, IV).decrypt(raw), 16).decode('utf-8', 'ignore'), flags=re.S)
+
+
+def encrypt(text):
+    raw = text.encode('utf-8')
+    return base64.b64encode(AES.new(KEY, AES.MODE_CBC, IV).encrypt(pad(raw, 16))).decode()
 
 
 def open_remote(req, timeout):
@@ -384,9 +390,34 @@ def get_html(path, timeout=30, retries=REMOTE_RETRIES):
     return d.decode('utf-8', 'ignore')
 
 
-def get_list(kind, page=1, type_id=None):
-    """解密某一分类某页的壁纸列表；返回 dict(list/pages/total) 或 None。"""
-    cache_key = (kind, page, type_id or TYPE_ID)
+WP_TYPES = {'home': '1,2', 'mobile': '2,5,6,8'}  # 官网列表接口的默认壁纸种类
+
+
+def _api_list(kind, page, search, sort_type=3):
+    """调用官网加密列表接口（搜索/排序与网页端一致），返回 dict(list/pages/total)。"""
+    form = {
+        'page': page,
+        'rows': 13 if kind == 'mobile' else 12,
+        'sortType': sort_type,
+        'isFavorites': False,
+        'wpType': WP_TYPES.get(kind, '1,2'),
+        'lbId': '',
+        'search': search or '',
+        'typeId': '',
+        'ratioId': '',
+        'ratioVal': '',
+        'colorId': '',
+        'imgSearch': '',
+    }
+    raw = json.dumps(form, separators=(',', ':'), ensure_ascii=False)
+    env = get_json('/link/pc/wallpaper/wallpaperList?data=' + urllib.parse.quote(encrypt(raw)))
+    return json.loads(decrypt(env['data']))
+
+
+def get_list(kind, page=1, type_id=None, search=None, sort_type=3):
+    """解密某一分类或搜索词某页的壁纸列表；返回 dict(list/pages/total) 或 None。"""
+    search = (search or '').strip()
+    cache_key = (kind, page, type_id or TYPE_ID, search, sort_type)
     now = time.monotonic()
     with _LIST_CACHE_LOCK:
         cached = _LIST_CACHE.get(cache_key)
@@ -396,22 +427,44 @@ def get_list(kind, page=1, type_id=None):
                 _LIST_CACHE.move_to_end(cache_key)
                 return data
             _LIST_CACHE.pop(cache_key, None)
-    view = 'mobileView' if kind == 'mobile' else 'homeView'
-    url = f'/{view}?page={page}&typeId={type_id or TYPE_ID}&sortType=3'
-    h = get_html(url, timeout=20, retries=1).replace('\\u002F', '/').replace('\\u002B', '+').replace('\\/', '/')
+    if search:
+        data = _api_list(kind, page, search, sort_type)
+    else:
+        view = 'mobileView' if kind == 'mobile' else 'homeView'
+        url = f'/{view}?' + urllib.parse.urlencode(
+            [('page', page), ('typeId', type_id or TYPE_ID), ('sortType', sort_type)])
+        data = _parse_ssr_list(get_html(url, timeout=20, retries=1))
+    if data is not None:
+        with _LIST_CACHE_LOCK:
+            _LIST_CACHE[cache_key] = (time.monotonic() + _LIST_CACHE_TTL, data)
+            _LIST_CACHE.move_to_end(cache_key)
+            while len(_LIST_CACHE) > _LIST_CACHE_MAX_ITEMS:
+                _LIST_CACHE.popitem(last=False)
+    return data
+
+
+def _parse_ssr_list(html):
+    """从 SSR 页面中提取并解密壁纸列表。"""
+    h = html.replace('\\u002F', '/').replace('\\u002B', '+').replace('\\/', '/')
     for c in re.findall(r'"([A-Za-z0-9+/]{200,}={0,2})"', h):
         try:
             o = json.loads(decrypt(c))
             if isinstance(o, dict) and 'list' in o and 'pages' in o:
-                with _LIST_CACHE_LOCK:
-                    _LIST_CACHE[cache_key] = (time.monotonic() + _LIST_CACHE_TTL, o)
-                    _LIST_CACHE.move_to_end(cache_key)
-                    while len(_LIST_CACHE) > _LIST_CACHE_MAX_ITEMS:
-                        _LIST_CACHE.popitem(last=False)
                 return o
         except Exception:
             continue
     return None
+
+
+def _public_items(data):
+    return [{
+        'wtId': it.get('wtId'),
+        'fileId': it.get('fileId'),
+        'title': _item_title(it),
+        'rw': it.get('rw'),
+        'rh': it.get('rh'),
+        'fileMb': it.get('fileMb'),
+    } for it in (data.get('list') or [])]
 
 
 def get_json(path):
@@ -1320,19 +1373,34 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 kind = qs.get('kind', ['home'])[0]
                 type_id = qs.get('type_id', [None])[0]
+                search = qs.get('search', [''])[0].strip()
+                sort_type = int(qs.get('sort', ['3'])[0] or 3)
                 page = int(qs.get('page', ['1'])[0])
-                data = get_list(kind, page, type_id)
+                data = get_list(kind, page, type_id, search=search, sort_type=sort_type)
                 if data is None:
                     raise RuntimeError('远端列表响应解析失败')
-                items = [{
-                    'wtId': it.get('wtId'),
-                    'fileId': it.get('fileId'),
-                    'title': _item_title(it),
-                    'rw': it.get('rw'),
-                    'rh': it.get('rh'),
-                    'fileMb': it.get('fileMb'),
-                } for it in (data.get('list') or [])]
                 self._json({'ok': True, 'page': page, 'pages': data.get('pages', 0),
+                            'total': data.get('total', 0), 'items': _public_items(data)})
+            except Exception as e:
+                self._json({'ok': False, 'error': str(e)}, _remote_error_status(e))
+
+        elif path == '/api/random':
+            try:
+                kind = qs.get('kind', ['home'])[0]
+                type_id = qs.get('type_id', [None])[0]
+                search = qs.get('search', [''])[0].strip()
+                sort_type = int(qs.get('sort', ['3'])[0] or 3)
+                first = get_list(kind, 1, type_id, search=search, sort_type=sort_type)
+                if first is None:
+                    raise RuntimeError('远端列表响应解析失败')
+                pages = int(first.get('pages') or 1)
+                page = random.randint(1, max(1, pages))
+                data = first if page == 1 else get_list(kind, page, type_id, search=search, sort_type=sort_type)
+                if data is None:
+                    data, page = first, 1
+                items = _public_items(data)
+                random.shuffle(items)
+                self._json({'ok': True, 'page': page, 'pages': pages,
                             'total': data.get('total', 0), 'items': items})
             except Exception as e:
                 self._json({'ok': False, 'error': str(e)}, _remote_error_status(e))
@@ -1481,6 +1549,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .tabs button{border:0;background:transparent;padding:7px 20px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--sub)}
   .tabs button.on{background:#fff;color:var(--txt);box-shadow:0 1px 3px rgba(0,0,0,.12);font-weight:600}
   select{padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:14px;background:#fff;color:var(--txt);min-width:170px}
+  .search{display:flex;align-items:center;border:1px solid var(--line);border-radius:8px;background:#fff;padding:0 10px}
+  .search input{border:0;outline:0;padding:8px 0;font-size:14px;width:180px;background:transparent;color:var(--txt)}
+  .search input::placeholder{color:#a9afb8}
+  .sorts{display:flex;background:var(--bg);border-radius:10px;padding:3px}
+  .sorts button{border:0;background:transparent;padding:7px 14px;border-radius:8px;cursor:pointer;font-size:14px;color:var(--sub)}
+  .sorts button.on{background:#fff;color:var(--txt);box-shadow:0 1px 3px rgba(0,0,0,.12);font-weight:600}
   .grow{flex:1}
   .count{font-size:13px;color:var(--sub);white-space:nowrap}
   .auth-area{display:flex;align-items:center}
@@ -1566,6 +1640,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <button data-kind="home" class="on">电脑</button>
   </div>
   <select id="cat"></select>
+  <div class="search"><input id="q" type="search" placeholder="搜索壁纸，回车确认" autocomplete="off"></div>
+  <div class="sorts" id="sorts">
+    <button data-sort="3" class="on">最热</button>
+    <button data-sort="1">最新</button>
+    <button data-sort="random">随机</button>
+  </div>
   <div class="grow"></div>
   <div class="count" id="count">已选 0 张</div>
   <div class="auth-area"><button class="auth-button" id="authbtn" aria-haspopup="dialog">
@@ -1610,7 +1690,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <button class="btn primary" id="dl" disabled>下载所选</button>
 </div>
 <script>
-const state={kind:'home',typeId:'',catName:'',page:1,pages:1,items:[],sel:new Map(),jobId:null,timer:null,loadController:null,loadRequest:0,pageCache:new Map(),pagePending:new Map(),loading:false,authReady:false,contentStarted:false,jobFinished:false,jobRunning:false,jobStatus:'',auth:{mode:'guest',accountId:null,name:'游客',active:null,accounts:[],guest:{used:0,remaining:5,limit:5},accountLimit:10,login:null,loginId:null,loginTimer:null}};
+const state={kind:'home',typeId:'',catName:'',search:'',sort:3,randomMode:false,page:1,pages:1,items:[],sel:new Map(),jobId:null,timer:null,loadController:null,loadRequest:0,pageCache:new Map(),pagePending:new Map(),loading:false,authReady:false,contentStarted:false,jobFinished:false,jobRunning:false,jobStatus:'',auth:{mode:'guest',accountId:null,name:'游客',active:null,accounts:[],guest:{used:0,remaining:5,limit:5},accountLimit:10,login:null,loginId:null,loginTimer:null}};
 const $=s=>document.querySelector(s);
 const esc=s=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 async function api(u,opt){
@@ -1622,8 +1702,17 @@ async function api(u,opt){
   return d;
 }
 function setHint(t){const h=$('#hint');h.textContent=t;h.style.display=t?'block':'none';}
-function listKey(kind,typeId,page){return kind+'|'+typeId+'|'+page;}
-function listUrl(kind,typeId,page){return '/api/list?kind='+encodeURIComponent(kind)+'&type_id='+encodeURIComponent(typeId)+'&page='+page;}
+function listKey(kind,typeId,page){return [kind,typeId,state.search,state.sort,page].join('|');}
+function listUrl(kind,typeId,page){
+  let u='/api/list?kind='+encodeURIComponent(kind)+'&page='+page+'&sort='+encodeURIComponent(state.sort);
+  u+=state.search?('&search='+encodeURIComponent(state.search)):('&type_id='+encodeURIComponent(typeId));
+  return u;
+}
+function randomUrl(kind,typeId){
+  let u='/api/random?kind='+encodeURIComponent(kind)+'&sort='+encodeURIComponent(state.sort);
+  u+=state.search?('&search='+encodeURIComponent(state.search)):('&type_id='+encodeURIComponent(typeId));
+  return u;
+}
 function prefetchPage(page,kind,typeId){
   const key=listKey(kind,typeId,page);
   if(state.pageCache.has(key)||state.pagePending.has(key))return;
@@ -1714,6 +1803,29 @@ async function loadCats(){
     await loadPage(1);
   }catch(e){setHint('分类加载失败：'+(e.message||'网络错误'));}
 }
+function renderGrid(d,random){
+  state.items=d.items||[];state.pages=d.pages||1;
+  const g=$('#grid');g.innerHTML='';
+  setHint(state.items.length?(random?'随机一批 · 再点「随机」换一批':''):'没有找到内容');
+  state.items.forEach(it=>{
+    const card=document.createElement('div');
+    card.className='card'+(state.sel.has(it.wtId)?' sel':'');
+    card.innerHTML='<img class="thumb" loading="lazy" src="/thumb?fileId='+encodeURIComponent(it.fileId)+'" alt="">'+
+      '<div class="tick">✓</div>'+
+      '<div class="meta"><div class="tt">'+esc(it.title)+'</div>'+
+      '<div class="dim"><span>'+(it.rw||'?')+'×'+(it.rh||'?')+'</span><span>'+esc(it.fileMb||'')+'</span></div></div>';
+    card.onclick=()=>{if(state.sel.has(it.wtId))state.sel.delete(it.wtId);else state.sel.set(it.wtId,it);card.classList.toggle('sel');updateBar();};
+    g.appendChild(card);
+  });
+  if(random){
+    $('#pager').style.display='none';
+    $('#pageinfo').textContent='';
+  }else{
+    $('#pager').style.display=state.items.length?'flex':'none';
+    $('#pageinfo').textContent='第 '+d.page+' / '+d.pages+' 页（本页 '+state.items.length+' 张）';
+  }
+  updateBar();
+}
 async function loadPage(p){
   if(state.loadController)state.loadController.abort();
   const requestNo=++state.loadRequest;
@@ -1721,7 +1833,7 @@ async function loadPage(p){
   const viewKind=state.kind;
   const viewTypeId=state.typeId;
   const pageKey=listKey(viewKind,viewTypeId,p);
-  state.page=p;setHint('加载中…');$('#grid').innerHTML='';$('#pager').style.display='none';
+  state.page=p;state.randomMode=false;setHint('加载中…');$('#grid').innerHTML='';$('#pager').style.display='none';
   state.loadController=controller;
   state.loading=true;
   $('#prev').disabled=true;$('#next').disabled=true;
@@ -1735,22 +1847,7 @@ async function loadPage(p){
     }
     if(requestNo!==state.loadRequest)return;
     if(!d.ok){setHint('加载失败：'+(d.error||''));return;}
-    state.items=d.items||[];state.pages=d.pages||1;
-    setHint(state.items.length?'':'该页没有内容');
-    const g=$('#grid');
-    state.items.forEach(it=>{
-      const card=document.createElement('div');
-      card.className='card'+(state.sel.has(it.wtId)?' sel':'');
-      card.innerHTML='<img class="thumb" loading="lazy" src="/thumb?fileId='+encodeURIComponent(it.fileId)+'" alt="">'+
-        '<div class="tick">✓</div>'+
-        '<div class="meta"><div class="tt">'+esc(it.title)+'</div>'+
-        '<div class="dim"><span>'+(it.rw||'?')+'×'+(it.rh||'?')+'</span><span>'+esc(it.fileMb||'')+'</span></div></div>';
-      card.onclick=()=>{if(state.sel.has(it.wtId))state.sel.delete(it.wtId);else state.sel.set(it.wtId,it);card.classList.toggle('sel');updateBar();};
-      g.appendChild(card);
-    });
-    $('#pager').style.display=state.items.length?'flex':'none';
-    $('#pageinfo').textContent='第 '+d.page+' / '+d.pages+' 页（本页 '+state.items.length+' 张）';
-    updateBar();
+    renderGrid(d,false);
   }catch(e){
     if(e.name!=='AbortError'&&requestNo===state.loadRequest)setHint('加载失败：'+(e.message||'网络错误'));
   }finally{
@@ -1762,6 +1859,27 @@ async function loadPage(p){
     }
   }
 }
+async function loadRandom(){
+  if(state.loadController)state.loadController.abort();
+  const requestNo=++state.loadRequest;
+  const controller=new AbortController();
+  state.randomMode=true;state.loadController=controller;state.loading=true;
+  setHint('随机挑选中…');$('#grid').innerHTML='';$('#pager').style.display='none';
+  try{
+    const d=await api(randomUrl(state.kind,state.typeId),{signal:controller.signal});
+    if(requestNo!==state.loadRequest)return;
+    if(!d.ok){setHint('加载失败：'+(d.error||''));return;}
+    renderGrid(d,true);
+  }catch(e){
+    if(e.name!=='AbortError'&&requestNo===state.loadRequest)setHint('加载失败：'+(e.message||'网络错误'));
+  }finally{
+    if(requestNo===state.loadRequest){state.loadController=null;state.loading=false;}
+  }
+}
+function refresh(){
+  state.pageCache.clear();state.sel.clear();updateBar();
+  if(state.randomMode)loadRandom();else loadPage(1);
+}
 
 $('#authbtn').onclick=async()=>{if(!state.authReady)return;$('#auth-modal').classList.add('on');try{await refreshAuthState();}catch(e){$('#auth-caption').textContent=e.message||'登录状态获取失败';}};
 $('#auth-close').onclick=()=>{if(state.authReady)$('#auth-modal').classList.remove('on');};
@@ -1771,9 +1889,21 @@ $('#auth-cancel').onclick=()=>cancelWechatLogin();
 $('#auth-list').onclick=e=>{const b=e.target.closest('[data-account-id]');if(b)selectAuth(b.dataset.accountId);};
 $('#tabs').onclick=e=>{const b=e.target.closest('button');if(!b)return;
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
-  state.kind=b.dataset.kind;state.pageCache.clear();state.sel.clear();updateBar();loadPage(1);};
+  state.kind=b.dataset.kind;refresh();};
 $('#cat').onchange=e=>{state.typeId=e.target.value;state.catName=e.target.options[e.target.selectedIndex].dataset.name;
-  state.pageCache.clear();state.sel.clear();updateBar();loadPage(1);};
+  refresh();};
+$('#sorts').onclick=e=>{const b=e.target.closest('button');if(!b)return;
+  document.querySelectorAll('#sorts button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
+  if(b.dataset.sort==='random'){state.randomMode=true;state.pageCache.clear();state.sel.clear();updateBar();loadRandom();return;}
+  state.sort=Number(b.dataset.sort);state.randomMode=false;refresh();};
+let searchTimer=null;
+function applySearch(){
+  const q=$('#q').value.trim();
+  if(q===state.search)return;
+  state.search=q;refresh();
+}
+$('#q').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(applySearch,500);};
+$('#q').onkeydown=e=>{if(e.key==='Enter'){clearTimeout(searchTimer);applySearch();}};
 $('#prev').onclick=()=>loadPage(Math.max(1,state.page-1));
 $('#next').onclick=()=>loadPage(Math.min(state.pages,state.page+1));
 $('#next').onmouseenter=()=>{if(!state.loading&&state.page<state.pages)prefetchPage(state.page+1,state.kind,state.typeId);};
