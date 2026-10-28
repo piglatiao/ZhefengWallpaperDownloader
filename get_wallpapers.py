@@ -390,7 +390,7 @@ def get_html(path, timeout=30, retries=REMOTE_RETRIES):
     return d.decode('utf-8', 'ignore')
 
 
-WP_TYPES = {'home': '1,2', 'mobile': '2,5,6,8'}  # 官网列表接口的默认壁纸种类
+WP_TYPES = {'home': '1', 'mobile': '2,5,6,8'}  # 官网列表接口的默认壁纸种类
 
 
 def _api_list(kind, page, search, sort_type=3):
@@ -1570,6 +1570,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .card:hover{box-shadow:0 6px 18px rgba(0,0,0,.12);transform:translateY(-2px)}
   .card.sel{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
   .thumb{width:100%;aspect-ratio:3/4;object-fit:cover;display:block;background:#eceef1}
+  .card.home .thumb{aspect-ratio:16/9}
   .meta{padding:8px 10px}
   .tt{font-size:13px;line-height:1.35;height:2.7em;overflow:hidden;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical}
   .dim{font-size:12px;color:var(--sub);margin-top:4px;display:flex;justify-content:space-between;gap:6px}
@@ -1809,7 +1810,7 @@ function renderGrid(d,random){
   setHint(state.items.length?(random?'随机一批 · 再点「随机」换一批':''):'没有找到内容');
   state.items.forEach(it=>{
     const card=document.createElement('div');
-    card.className='card'+(state.sel.has(it.wtId)?' sel':'');
+    card.className='card '+state.kind+(state.sel.has(it.wtId)?' sel':'');
     card.innerHTML='<img class="thumb" loading="lazy" src="/thumb?fileId='+encodeURIComponent(it.fileId)+'" alt="">'+
       '<div class="tick">✓</div>'+
       '<div class="meta"><div class="tt">'+esc(it.title)+'</div>'+
