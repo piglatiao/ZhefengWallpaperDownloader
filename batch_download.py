@@ -1141,9 +1141,18 @@ def choose_count():
 def pick_proxy_file(explicit=None):
     if explicit:
         return explicit
-    root = os.path.dirname(os.path.abspath(__file__))
-    cands = [os.path.join(root, f) for f in os.listdir(root)
-             if re.match(r'^proxies.*\.txt$', f, re.I)]
+    roots = [RUNTIME_DIR, os.getcwd(), os.path.dirname(RUNTIME_DIR)]
+    seen = set()
+    cands = []
+    for root in roots:
+        root = os.path.abspath(root)
+        if root in seen or not os.path.isdir(root):
+            continue
+        seen.add(root)
+        cands.extend(
+            os.path.join(root, f) for f in os.listdir(root)
+            if re.match(r'^proxies.*\.txt$', f, re.I)
+        )
     if not cands:
         return None
     return max(cands, key=os.path.getmtime)
@@ -1269,13 +1278,22 @@ def main():
             return 2
     workers = max(1, min(30, args.workers or WORKERS))
 
+    proxy_file = pick_proxy_file(args.proxy_file)
+    if not proxy_file or not os.path.isfile(proxy_file):
+        print('未找到代理 txt，请将 proxies*.txt 放在 exe 同目录，或用 -p 指定')
+        return 1
+    entries = load_proxies(proxy_file)
+    if not entries:
+        print(f'{proxy_file} 中没有有效代理行')
+        return 1
+
     global CHAIN_PROXY
     if args.upstream:
         CHAIN_PROXY = args.upstream
     elif os.environ.get('PROXY_CHAIN'):
         CHAIN_PROXY = os.environ['PROXY_CHAIN']
     else:
-        probe_u = urllib.parse.urlparse(load_proxies(pick_proxy_file(args.proxy_file))[0])
+        probe_u = urllib.parse.urlparse(entries[0])
         try:
             with socket.create_connection((probe_u.hostname, probe_u.port), timeout=4):
                 CHAIN_PROXY = None
@@ -1288,14 +1306,6 @@ def main():
     if CHAIN_PROXY:
         log(f'级联：{CHAIN_PROXY} -> 代理池')
 
-    proxy_file = pick_proxy_file(args.proxy_file)
-    if not proxy_file or not os.path.isfile(proxy_file):
-        print('未找到代理 txt，请用 -p 指定')
-        return 1
-    entries = load_proxies(proxy_file)
-    if not entries:
-        print(f'{proxy_file} 中没有有效代理行')
-        return 1
     pool = ProxyPool(entries, UsageState(STATE_FILE))
     log(f'代理文件 {proxy_file}：{len(entries)} 条')
 

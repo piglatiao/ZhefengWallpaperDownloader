@@ -3,3 +3,8 @@ browser
 dist*
 build_single
 哲风壁纸*
+proxy_usage.json
+电脑/
+手机/
+build_batch
+__pycache__/

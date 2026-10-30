@@ -6,8 +6,25 @@ $ErrorActionPreference = 'Stop'
 $script:ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Definition
 Set-Location -LiteralPath $script:ProjectRoot
 
-$script:SourcePath = Join-Path $script:ProjectRoot 'get_wallpapers.py'
-$script:SpecPath = Join-Path $script:ProjectRoot 'get_wallpapers.spec'
+$script:AppConfigs = @{
+    '1' = [pscustomobject]@{
+        Name = '浏览器下载'
+        Source = 'get_wallpapers.py'
+        Spec = 'get_wallpapers.spec'
+        Dist = 'dist_single'
+        Work = 'build_single'
+        Exe = 'get_wallpapers.exe'
+    }
+    '2' = [pscustomobject]@{
+        Name = '代理池下载'
+        Source = 'batch_download.py'
+        Spec = 'batch_download.spec'
+        Dist = 'dist_batch'
+        Work = 'build_batch'
+        Exe = 'batch_download.exe'
+    }
+}
+$script:SelectedApp = $null
 $script:VenvRoot = Join-Path $script:ProjectRoot '.venv'
 $script:VenvPython = Join-Path $script:ProjectRoot '.venv\Scripts\python.exe'
 $script:BrowserExe = Join-Path $script:ProjectRoot 'browser\chrome-win64\chrome.exe'
@@ -136,8 +153,10 @@ function Test-VenvPython {
 
 # 检查虚拟环境中的 Python 包和 PyInstaller。
 function Get-EnvironmentStatus {
-    $sourceOk = Test-Path -LiteralPath $script:SourcePath -PathType Leaf
-    $specOk = Test-Path -LiteralPath $script:SpecPath -PathType Leaf
+    $sourcePath = Join-Path $script:ProjectRoot $script:SelectedApp.Source
+    $specPath = Join-Path $script:ProjectRoot $script:SelectedApp.Spec
+    $sourceOk = Test-Path -LiteralPath $sourcePath -PathType Leaf
+    $specOk = Test-Path -LiteralPath $specPath -PathType Leaf
     $hostPythonOk = $null -ne $script:HostPythonPath
     $venvOk = Test-VenvPython
     $dependenciesOk = $false
@@ -159,8 +178,8 @@ function Get-EnvironmentStatus {
     $browserOk = (Test-Path -LiteralPath $script:BrowserExe -PathType Leaf) -and
         (Test-Path -LiteralPath $script:BrowserDll -PathType Leaf)
     $missing = @()
-    if (-not $sourceOk) { $missing += 'get_wallpapers.py' }
-    if (-not $specOk) { $missing += 'get_wallpapers.spec' }
+    if (-not $sourceOk) { $missing += $script:SelectedApp.Source }
+    if (-not $specOk) { $missing += $script:SelectedApp.Spec }
     if (-not $hostPythonOk) { $missing += 'Python 3.10+' }
     if (-not $venvOk) { $missing += '.venv' }
     if (-not $dependenciesOk) { $missing += 'Python 依赖包' }
@@ -185,6 +204,7 @@ function Show-EnvironmentStatus {
 
     Write-Host ''
     Write-Host '========== 环境检查 ==========' -ForegroundColor Cyan
+    Write-Host ('当前程序：' + $script:SelectedApp.Name) -ForegroundColor Cyan
     Write-CheckResult '源代码' $Status.Source
     Write-CheckResult '打包配置' $Status.Spec
     Write-CheckResult 'Python' $Status.HostPython $(if ($script:HostPythonPath) { $script:HostPythonPath } else { '未找到 Python 3.10+' })
@@ -275,33 +295,60 @@ function Install-MissingEnvironment {
     }
 }
 
+# 选择要运行或打包的下载程序。
+function Select-Program {
+    while ($true) {
+        Write-Host ''
+        Write-Host '请选择程序：' -ForegroundColor Cyan
+        Write-Host '  1. 浏览器下载（get_wallpapers.py）'
+        Write-Host '  2. 代理池下载（batch_download.py）'
+        Write-Host '  Q. 退出'
+        $choice = (Read-Host '请选择 [1/2/Q]').Trim().ToUpperInvariant()
+        if ($choice -eq 'Q') {
+            return $false
+        }
+        if ($script:AppConfigs.ContainsKey($choice)) {
+            $script:SelectedApp = $script:AppConfigs[$choice]
+            return $true
+        }
+        Write-Host '输入无效，请重新选择。' -ForegroundColor Yellow
+    }
+}
+
 function Run-SourceProgram {
-    Write-Host '正在启动源码程序 ...' -ForegroundColor Cyan
-    Invoke-VenvPython @($script:SourcePath)
+    $sourcePath = Join-Path $script:ProjectRoot $script:SelectedApp.Source
+    Write-Host ('正在启动' + $script:SelectedApp.Name + '源码 ...') -ForegroundColor Cyan
+    Invoke-VenvPython @($sourcePath)
 }
 
 function Build-Executable {
-    $distPath = Join-Path $script:ProjectRoot 'dist_single'
-    $workPath = Join-Path $script:ProjectRoot 'build_single'
-    Write-Host '正在构建单文件 exe ...' -ForegroundColor Cyan
+    $specPath = Join-Path $script:ProjectRoot $script:SelectedApp.Spec
+    $distPath = Join-Path $script:ProjectRoot $script:SelectedApp.Dist
+    $workPath = Join-Path $script:ProjectRoot $script:SelectedApp.Work
+    Write-Host ('正在构建' + $script:SelectedApp.Name + '单文件 exe ...') -ForegroundColor Cyan
     Invoke-VenvPython @(
         '-m', 'PyInstaller',
         '--clean',
         '--noconfirm',
         '--distpath', $distPath,
         '--workpath', $workPath,
-        $script:SpecPath
+        $specPath
     )
 
-    $exePath = Join-Path $distPath 'get_wallpapers.exe'
+    $exePath = Join-Path $distPath $script:SelectedApp.Exe
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
-        throw 'PyInstaller 执行完成，但没有找到 dist_single\get_wallpapers.exe。'
+        throw ('PyInstaller 执行完成，但没有找到 ' + $script:SelectedApp.Dist + '\' + $script:SelectedApp.Exe + '。')
     }
     Write-Host ''
     Write-Host ('构建完成：' + $exePath) -ForegroundColor Green
 }
 
 try {
+    if (-not (Select-Program)) {
+        Write-Host '已退出。'
+        exit 0
+    }
+
     $hostPython = Find-HostPython
     if ($null -eq $hostPython) {
         Show-PythonDownloadPrompt
