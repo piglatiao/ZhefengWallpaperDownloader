@@ -129,6 +129,7 @@ MAX_ITEM_TRIES = 3       # 单张最多换几个 IP 重试
 ITEM_TIMEOUT = 220       # 单张判死秒数：页面加载 40s + 点下载后等直链 120s + 余量
 VERIFY_WORKERS = 8       # 并发验证代理
 VERIFY_TIMEOUT = 10
+SAVE_LOCK = threading.Lock()  # 防止并发下载时同名文件互相覆盖
 KIND_NAME = {'home': '电脑', 'mobile': '手机'}
 SORT_NAME = {1: '最热', 2: '最新', 3: '随机'}
 
@@ -823,7 +824,7 @@ def name_from_item(it, ext='.jpg'):
     return f'【哲风壁纸】{base}{ext}'
 
 
-def save_file(url, out_dir, suggested, proxy_url, fallback=None):
+def save_file(url, out_dir, suggested, proxy_url, fallback=None, unique_key=None):
     """下载直链：代理和直连同时赛跑，谁先连上就用谁，大文件走直连通常更快。"""
     out = {}
 
@@ -857,9 +858,22 @@ def save_file(url, out_dir, suggested, proxy_url, fallback=None):
         t.join()
     if 'win' in out:
         tag, name, data = out['win']
-        path = os.path.join(out_dir, name)
-        with open(path, 'wb') as f:
-            f.write(data)
+        with SAVE_LOCK:
+            path = os.path.join(out_dir, name)
+            if os.path.exists(path):
+                stem, ext = os.path.splitext(name)
+                safe_key = re.sub(r'[^0-9A-Za-z_-]+', '_', str(unique_key or 'copy')).strip('_')
+                safe_key = safe_key or 'copy'
+                candidate = f'{stem}_{safe_key}{ext}'
+                path = os.path.join(out_dir, candidate)
+                index = 2
+                while os.path.exists(path):
+                    candidate = f'{stem}_{safe_key}_{index}{ext}'
+                    path = os.path.join(out_dir, candidate)
+                    index += 1
+                name = candidate
+            with open(path, 'wb') as f:
+                f.write(data)
         return name, len(data), tag
     raise out.get('direct_err') or out.get('proxy_err') or RuntimeError('下载失败')
 
@@ -1006,7 +1020,8 @@ def run_batch(items, kind, out_dir, pool, workers=WORKERS):
 
                     try:
                         name, size, via = save_file(direct, out_dir, fname, lp.url,
-                                                    fallback=name_from_item(it))
+                                                    fallback=name_from_item(it),
+                                                    unique_key=it['wtId'])
                         g, d = bump(got=1, done=1)
                         left = settle()
                         log(f'[W{idx}] OK {name} {size / 1048576:.2f}MB ← {key} [{via}]'

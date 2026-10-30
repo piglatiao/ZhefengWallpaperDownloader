@@ -8,3 +8,6 @@ proxy_usage.json
 手机/
 build_batch
 __pycache__/
+batch_download.py
+.gitignore
+proxies*.txt
