@@ -614,8 +614,31 @@ def _wait_page_ready(c, timeout=15):
     return False
 
 
+BLOCK_PATTERNS = ()     # 详情页里屏蔽的第三方 URL 模式，由外部脚本按需注入
+DOWNLOAD_WAIT_ROUNDS = 30   # 点下载后等直链的轮数，每轮 2 秒
+
+
+def _wait_button(c, timeout=20, settle=1.2):
+    """只要下载按钮渲染出来就算就绪；被屏蔽资源拖住 readyState 时也能继续。
+    settle 是按钮出现后再等的水合时间，让 Vue 挂上点击事件。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if c.evl("!!document.querySelector('.DownButtom .hao-bottom-nav-end__face, "
+                     ".DownButtom .hao-bottom-nav-end')"):
+                if settle:
+                    time.sleep(settle)
+                return True
+        except Exception:
+            pass
+        time.sleep(0.6)
+    return False
+
+
 class BrowserSession:
     """单个 Chrome 进程，供一次下载任务的全部壁纸复用；可见模式全程只弹一个窗口。"""
+
+    extra_args = ()          # 外部脚本可注入额外的 Chrome 启动参数
 
     def __init__(self, headless=True, proxy=None, profile_dir=None):
         self.port = free_port()
@@ -638,6 +661,7 @@ class BrowserSession:
                  f'--user-data-dir={self.prof}',
                  f'--remote-debugging-port={self.port}',
                  '--remote-allow-origins=*']
+        args += list(type(self).extra_args)
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self._wait_ready()
         self._deny_downloads()
@@ -784,17 +808,24 @@ def get_one(sess, kind, wid):
     target_id = None
     try:
         view = 'mobileViewLook' if kind == 'mobile' else 'homeViewLook'
-        c, target_id = sess.new_tab(f'{BASE}/{view}/{wid}')
+        c, target_id = sess.new_tab('about:blank')
         c.send('Network.enable')
         c.send('Runtime.enable')
+        if BLOCK_PATTERNS:
+            # 详情页只要按钮与脚本，图片/字体/统计类资源一屏蔽，代理连接数和耗时都降一个量级
+            try:
+                c.send('Network.setBlockedURLs', {'urls': list(BLOCK_PATTERNS)})
+            except Exception:
+                pass
         c.send('Page.setDownloadBehavior', {'behavior': 'deny'})
-        if not _wait_page_ready(c, timeout=15):
+        c.send('Page.navigate', {'url': f'{BASE}/{view}/{wid}'})
+        if not _wait_button(c, timeout=20):
             # 详情页首屏偶发停留在 loading，刷新一次后重新等待页面渲染。
             try:
                 c.send('Page.reload', {'ignoreCache': True})
             except Exception:
                 return None, 'PAGE_RELOAD', None
-            if not _wait_page_ready(c, timeout=20):
+            if not _wait_button(c, timeout=20):
                 return None, 'PAGE_TIMEOUT', None
 
         c.ev.clear()
@@ -816,8 +847,8 @@ def get_one(sess, kind, wid):
         response_events = {}
         finished_requests = set()
         response_error = None
-        # 等待下载响应及页面验证组件完成（最多约 60 秒）
-        for _ in range(30):
+        # 等待下载响应及页面验证组件完成（轮数 × 2 秒）
+        for _ in range(DOWNLOAD_WAIT_ROUNDS):
             time.sleep(2)
             c.pump()
             suggested_filename = sess.take_download_filename() or suggested_filename
