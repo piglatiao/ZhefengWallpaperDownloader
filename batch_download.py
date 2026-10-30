@@ -71,7 +71,15 @@ def _init_console():
 
 _init_console()
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+def _runtime_dir():
+    """返回程序运行目录；单文件 exe 使用 exe 所在目录。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+RUNTIME_DIR = _runtime_dir()
+sys.path.insert(0, RUNTIME_DIR)
 import get_wallpapers as gw  # 复用已逆向验证的列表 / 浏览器 / 直链逻辑
 
 # Chrome 预连接会一次给每个域名开好几条连接，代理受限时容易打满；限流后再提速
@@ -92,7 +100,7 @@ gw.BLOCK_PATTERNS = (
     '*doubleclick*', '*facebook*', '*twitter*', '*youtube*', '*gvt1.com*',
 )
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'proxy_usage.json')
+STATE_FILE = os.path.join(RUNTIME_DIR, 'proxy_usage.json')
 GUEST_LIMIT = 5          # 游客单 IP 每日额度
 WORKERS = 10             # 同时开几个无痕浏览器线程
 PAGE_DELAY = (5.0, 10.0) # 每张之间随机停顿秒数（放慢，别把站点和代理压太狠）
