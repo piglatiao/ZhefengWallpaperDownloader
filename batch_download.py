@@ -82,6 +82,26 @@ RUNTIME_DIR = _runtime_dir()
 sys.path.insert(0, RUNTIME_DIR)
 import get_wallpapers as gw  # 复用已逆向验证的列表 / 浏览器 / 直链逻辑
 
+
+def _pause_before_exit():
+    """单文件 exe 出错时暂停控制台，避免双击启动后窗口立即关闭。"""
+    if not getattr(sys, 'frozen', False):
+        return
+    try:
+        input('\n按回车键退出...')
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _proxy_search_roots():
+    """返回代理配置文件的候选目录，并按优先级去重。"""
+    roots = []
+    for root in (RUNTIME_DIR, os.getcwd(), os.path.dirname(RUNTIME_DIR)):
+        root = os.path.abspath(root)
+        if root not in roots and os.path.isdir(root):
+            roots.append(root)
+    return roots
+
 # Chrome 预连接会一次给每个域名开好几条连接，代理受限时容易打满；限流后再提速
 gw.BrowserSession.extra_args = (
     '--disable-background-networking',
@@ -1141,14 +1161,8 @@ def choose_count():
 def pick_proxy_file(explicit=None):
     if explicit:
         return explicit
-    roots = [RUNTIME_DIR, os.getcwd(), os.path.dirname(RUNTIME_DIR)]
-    seen = set()
     cands = []
-    for root in roots:
-        root = os.path.abspath(root)
-        if root in seen or not os.path.isdir(root):
-            continue
-        seen.add(root)
+    for root in _proxy_search_roots():
         cands.extend(
             os.path.join(root, f) for f in os.listdir(root)
             if re.match(r'^proxies.*\.txt$', f, re.I)
@@ -1280,11 +1294,17 @@ def main():
 
     proxy_file = pick_proxy_file(args.proxy_file)
     if not proxy_file or not os.path.isfile(proxy_file):
-        print('未找到代理 txt，请将 proxies*.txt 放在 exe 同目录，或用 -p 指定')
+        print('未找到代理配置文件（proxies*.txt）。')
+        print('请将代理文件放在以下任一目录：')
+        for root in _proxy_search_roots():
+            print(f'  {root}')
+        print('也可以使用 -p "代理文件完整路径" 指定。')
+        _pause_before_exit()
         return 1
     entries = load_proxies(proxy_file)
     if not entries:
         print(f'{proxy_file} 中没有有效代理行')
+        _pause_before_exit()
         return 1
 
     global CHAIN_PROXY
@@ -1362,6 +1382,7 @@ def main():
     alive = pool.prefilter(workers=args.verify_workers, timeout=args.verify_timeout, keep=need)
     if alive <= 0:
         log('预过滤后没有可用代理，检查上级代理或换一份代理文件')
+        _pause_before_exit()
         return 1
     if alive < need:
         log(f'可用代理只有 {alive} 个，最多再下 {alive * GUEST_LIMIT} 张')
